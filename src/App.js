@@ -4,12 +4,14 @@ import Main from "./components/Main";
 import Loader from "./components/Loader";
 import Error from "./components/Error";
 import StartScreen from "./components/StartScreen";
+import Questions from "./components/Questions";
 
 const initialState = {
   questions: {},
   // Status can be in following states: "loading", "error", "ready", 
   // "active", "finished"
-  status: 'loading'
+  status: 'loading',
+  index: 0
 };
 
 function reducer(currState, action) {
@@ -25,7 +27,10 @@ function reducer(currState, action) {
       return {
         ...currState,
         status: 'error'
-      }
+      };
+
+    case 'start':
+      return { ...currState, status: 'active' };
 
     default:
       throw new Error("Unknown action");
@@ -34,7 +39,7 @@ function reducer(currState, action) {
 
 function App() {
   const [state, dispatch] = useReducer(reducer, initialState);
-  const { questions, status } = state;
+  const { questions, status, index } = state;
 
   const numOfQuestions = questions.length;
 
@@ -57,7 +62,12 @@ function App() {
       <Main>
         {status === 'loading' && <Loader />}
         {status === 'error' && <Error />}
-        {status === 'ready' && <StartScreen num={numOfQuestions} />}
+        {status === 'ready' &&
+          <StartScreen
+            num={numOfQuestions}
+            dispatch={dispatch}
+          />}
+        {status === 'active' && <Questions question={questions[index]} />}
       </Main>
     </div>
   );
