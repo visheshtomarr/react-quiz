@@ -11,7 +11,9 @@ const initialState = {
   // Status can be in following states: "loading", "error", "ready", 
   // "active", "finished"
   status: 'loading',
-  index: 0
+  index: 0,
+  answer: null,
+  points: 0
 };
 
 function reducer(currState, action) {
@@ -32,6 +34,18 @@ function reducer(currState, action) {
     case 'start':
       return { ...currState, status: 'active' };
 
+    case 'newAnswer':
+      const currQuestion = currState.questions[currState.index];
+
+      return {
+        ...currState,
+        answer: action.payload,
+        points:
+          action.payload === currQuestion.correctOption
+            ? currState.points + currQuestion.points
+            : currState.points
+      };
+
     default:
       throw new Error("Unknown action");
   }
@@ -39,7 +53,7 @@ function reducer(currState, action) {
 
 function App() {
   const [state, dispatch] = useReducer(reducer, initialState);
-  const { questions, status, index } = state;
+  const { questions, status, index, answer } = state;
 
   const numOfQuestions = questions.length;
 
@@ -67,7 +81,12 @@ function App() {
             num={numOfQuestions}
             dispatch={dispatch}
           />}
-        {status === 'active' && <Questions question={questions[index]} />}
+        {status === 'active' &&
+          <Questions
+            question={questions[index]}
+            dispatch={dispatch}
+            answer={answer}
+          />}
       </Main>
     </div>
   );
