@@ -98,15 +98,22 @@ function QuizProvider({ children }) {
         secondsRemaining
     } = state;
 
-    const numOfQuestions = questions.length;
-    const maxPoints = questions.reduce((prev, curr) => prev + curr.points, 0);
+    const numOfQuestions = Array.isArray(questions) ? questions.length : 0;
+    const maxPoints = Array.isArray(questions)
+        ? questions.reduce((prev, curr) => prev + (curr.points || 0), 0)
+        : 0;
 
     useEffect(() => {
         async function fetchData() {
             try {
-                const res = await fetch("http://localhost:5000/questions");
+                const res = await fetch("/data/questions.json");
                 const data = await res.json();
-                dispatch({ type: 'dataReceived', payload: data });
+                const payload = Array.isArray(data)
+                    ? data
+                    : Array.isArray(data?.questions)
+                        ? data.questions
+                        : [];
+                dispatch({ type: 'dataReceived', payload });
             } catch (error) {
                 dispatch({ type: 'dataFailed' });
             }
