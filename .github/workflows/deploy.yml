@@ -35,8 +35,8 @@ jobs:
           chmod 600 private_key.pem
 
           # Rsync to copy build files to EC2 instance
-          rsync -avz -e "ssh -i private_key.pem -o StrictHostKeyChecking=no" ./build/ ec2-user@<EC2_PUBLIC_IP>:/var/www/react-quiz/
+          rsync -avz -e "ssh -i private_key.pem -o StrictHostKeyChecking=no" ./build/ ec2-user@$EC2_PUBLIC_IP:/var/www/react-quiz/
 
       - name: Reload Nginx
         run: |
-          ssh -i private_key.pem -o StrictHostKeyChecking=no ec2-user@<EC2_PUBLIC_IP> 'sudo systemctl reload nginx'
+          ssh -i private_key.pem -o StrictHostKeyChecking=no ec2-user@$EC2_PUBLIC_IP 'sudo systemctl reload nginx'
