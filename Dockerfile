@@ -1,5 +1,5 @@
 # Step 1: Build the React application
-FROM node:alpine:3.18 as build
+FROM node:18-alpine3.18 as build
 WORKDIR /react-quiz
 COPY package.json .
 RUN npm install
