@@ -36,6 +36,9 @@ jobs:
       - name: Pull image from Docker Hub
         run: docker pull visheshtomarr/react-quiz-app:latest
 
+      - name: Delete existing container
+        run: docker rm -f reactQuizApp
+
       - name: Run Docker container
         run: docker run -d -p 3000:80 --name reactQuizApp visheshtomarr/react-quiz-app
 
