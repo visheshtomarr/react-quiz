@@ -24,7 +24,7 @@ jobs:
         run: docker build -t visheshtomarr/react-quiz-app .
 
       - name: Push Docker Image to Docker Hub
-        run: docker push visheshtomarr/react-quiz-app:lastest
+        run: docker push visheshtomarr/react-quiz-app:latest
 
   deploy:
     needs: build
