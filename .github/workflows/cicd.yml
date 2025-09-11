@@ -2,17 +2,15 @@ name: CICD Pipeline
 
 on:
   push:
-    branches:
-      - main # Trigger deploy on pushes to the main branch
+    branches: [main]
 
 jobs:
-  build:
+  build-and-push:
     runs-on: ubuntu-latest
     environment: react-quiz-env
-
     steps:
-      - name: Checkout Source Code
-        uses: actions/checkout@v3
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Login to Docker Hub
         uses: docker/login-action@v3
@@ -20,59 +18,58 @@ jobs:
           username: ${{ secrets.DOCKER_HUB_USERNAME }}
           password: ${{ secrets.DOCKER_HUB_PASSWORD }}
 
-      - name: Build Docker Image
-        run: docker build -t visheshtomarr/react-quiz-app .
+      - name: Build & tag image
+        run: |
+          docker build \
+            -t visheshtomarr/react-quiz-app:latest \
+            -t visheshtomarr/react-quiz-app:${{ github.sha }} \
+            .
 
-      - name: Push Docker Image to Docker Hub
-        run: docker push visheshtomarr/react-quiz-app:latest
+      - name: Push images
+        run: |
+          docker push visheshtomarr/react-quiz-app:latest
+          docker push visheshtomarr/react-quiz-app:${{ github.sha }}
 
-  deploy:
-    needs: build
-    # Will be executed on a runner on github
-    runs-on: aws-ec2
-    environment: react-quiz-env
-
+  rollout:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
     steps:
-      - name: Pull image from Docker Hub
-        run: docker pull visheshtomarr/react-quiz-app:latest
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Delete existing container
-        run: docker rm -f reactQuizApp
+      - name: (Optional) Raise ASG max size for safer rolling
+        run: |
+          aws autoscaling update-auto-scaling-group \
+            --auto-scaling-group-name "${{ secrets.ASG_NAME }}" \
+            --max-size 8
 
-      - name: Run Docker container
-        run: docker run -d -p 3000:80 --name reactQuizApp visheshtomarr/react-quiz-app
+      - name: Start rolling Instance Refresh
+        run: |
+          aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name "${{ secrets.ASG_NAME }}" \
+            --preferences MinHealthyPercentage=90,InstanceWarmup=120
 
-      # - name: Set up Node.js
-      #   uses: actions/setup-node@v3
-      #   with:
-      #     node-version: "16"
+      - name: Wait for Instance Refresh to complete
+        run: |
+          ASG="${{ secrets.ASG_NAME }}"
+          for i in {1..120}; do
+            STATUS=$(aws autoscaling describe-instance-refreshes --auto-scaling-group-name "$ASG" --query 'InstanceRefreshes[0].Status' --output text)
+            echo "Refresh status: $STATUS"
+            if [ "$STATUS" = "Successful" ]; then exit 0; fi
+            if [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "Failed" ]; then exit 1; fi
+            sleep 15
+          done
+          echo "Timed out waiting for instance refresh"; exit 1
 
-      # - name: Install dependencies
-      #   run: npm install
-
-      # - name: Build React app
-      #   run: npm run build
-
-      # - name: Copy build files to EC2
-      #   env:
-      #     PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
-      #     EC2_PUBLIC_IP: ${{ secrets.EC2_PUBLIC_IP_ADDRESS }}
-      #   run: |
-      #     # Write the private key to a file
-      #     echo "$PRIVATE_KEY" > private_key.pem
-      #     chmod 600 private_key.pem
-
-      #     # Rsync to copy build files to EC2 instance
-      #     rsync -avz -e "ssh -i private_key.pem -o StrictHostKeyChecking=no" ./build/ ec2-user@$EC2_PUBLIC_IP:/var/www/react-quiz/
-
-      # - name: Reload Nginx
-      #   env:
-      #     PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
-      #     EC2_PUBLIC_IP: ${{ secrets.EC2_PUBLIC_IP_ADDRESS }}
-      #   run: |
-      #     # Write the private key to a file
-      #     echo "$PRIVATE_KEY" > private_key.pem
-      #     chmod 600 private_key.pem
-
-      #     # Reload Nginx on the EC2 instance
-      #     ssh -i private_key.pem -o StrictHostKeyChecking=no ec2-user@$EC2_PUBLIC_IP 'sudo systemctl reload nginx'
+      - name: Restore ASG max size
+        if: always()
+        run: |
+          aws autoscaling update-auto-scaling-group \
+            --auto-scaling-group-name "${{ secrets.ASG_NAME }}" \
+            --max-size 6
