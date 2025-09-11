@@ -33,6 +33,7 @@ jobs:
   rollout:
     needs: build-and-push
     runs-on: ubuntu-latest
+    environment: react-quiz-env
     permissions:
       id-token: write
       contents: read
