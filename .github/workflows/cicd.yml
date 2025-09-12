@@ -1,9 +1,5 @@
 name: CICD Pipeline
 
-permissions:
-  id-token: write
-  contents: read
-
 on:
   push:
     branches: [main]
@@ -39,28 +35,14 @@ jobs:
     env:
       AWS_REGION: ${{ secrets.AWS_REGION }}
     steps:
-      - name: Debug OIDC token (non-blocking)
-        continue-on-error: true
-        run: |
-          echo "Requesting OIDC ID token..."
-          ID_TOKEN=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL" | jq -r .value)
-          if [ -z "$ID_TOKEN" ] || [ "$ID_TOKEN" = "null" ]; then
-            echo "No ID token returned. This run likely does not have an OIDC token (fork PR or restricted run)."
-            exit 0
-          fi
-          echo "Decoded ID token payload:"
-          python3 - <<'PY' "$ID_TOKEN"
-          import sys, json, base64
-          t = sys.argv[1]
-          parts = t.split('.')
-          payload = parts[1] + '=' * (-len(parts[1]) % 4)
-          print(json.dumps(json.loads(base64.urlsafe_b64decode(payload)), indent=2))
-          PY
-
       - name: Check required secrets
         run: |
-          if [ -z "${AWS_ROLE_ARN}" ]; then
-            echo "ERROR: AWS_ROLE_ARN secret is not set in repository settings."
+          if [ -z "${AWS_ACCESS_KEY_ID}" ]; then
+            echo "ERROR: AWS_ACCESS_KEY_ID secret is not set in repository settings."
+            exit 1
+          fi
+          if [ -z "${AWS_SECRET_ACCESS_KEY}" ]; then
+            echo "ERROR: AWS_SECRET_ACCESS_KEY secret is not set in repository settings."
             exit 1
           fi
           if [ -z "${AWS_REGION}" ]; then
@@ -72,14 +54,16 @@ jobs:
             exit 1
           fi
         env:
-          AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_REGION: ${{ secrets.AWS_REGION }}
           ASG_NAME: ${{ secrets.ASG_NAME }}
 
-      - name: Configure AWS credentials via OIDC
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
       - name: (Optional) Raise ASG max size for safer rolling
