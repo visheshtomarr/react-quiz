@@ -1,5 +1,9 @@
 name: CICD Pipeline
 
+permissions:
+  id-token: write
+  contents: read
+
 on:
   push:
     branches: [main]
@@ -34,9 +38,6 @@ jobs:
     needs: build-and-push
     runs-on: ubuntu-latest
     environment: react-quiz-env
-    permissions:
-      id-token: write
-      contents: read
     steps:
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
