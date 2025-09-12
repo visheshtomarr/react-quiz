@@ -38,26 +38,45 @@ jobs:
     needs: build-and-push
     runs-on: ubuntu-latest
     environment: react-quiz-env
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
     steps:
-      - name: Debug OIDC token
+      - name: Debug OIDC token (non-blocking)
+        continue-on-error: true
         run: |
           echo "Requesting OIDC ID token..."
           ID_TOKEN=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL" | jq -r .value)
-          if [ -z "$ID_TOKEN" ]; then
+          if [ -z "$ID_TOKEN" ] || [ "$ID_TOKEN" = "null" ]; then
             echo "No ID token returned. This run likely does not have an OIDC token (fork PR or restricted run)."
-            exit 1
+            exit 0
           fi
           echo "Decoded ID token payload:"
-          python3 - <<'PY'
-          import os, base64, json
-          id_token = os.environ.get("ID_TOKEN")
-          parts = id_token.split('.')
+          python3 - <<'PY' "$ID_TOKEN"
+          import sys, json, base64
+          t = sys.argv[1]
+          parts = t.split('.')
           payload = parts[1] + '=' * (-len(parts[1]) % 4)
           print(json.dumps(json.loads(base64.urlsafe_b64decode(payload)), indent=2))
           PY
+
+      - name: Check required secrets
+        run: |
+          if [ -z "${AWS_ROLE_ARN}" ]; then
+            echo "ERROR: AWS_ROLE_ARN secret is not set in repository settings."
+            exit 1
+          fi
+          if [ -z "${AWS_REGION}" ]; then
+            echo "ERROR: AWS_REGION secret is not set in repository settings."
+            exit 1
+          fi
+          if [ -z "${ASG_NAME}" ]; then
+            echo "ERROR: ASG_NAME secret is not set in repository settings."
+            exit 1
+          fi
         env:
-          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ${{ env.ACTIONS_ID_TOKEN_REQUEST_TOKEN }}
-          ACTIONS_ID_TOKEN_REQUEST_URL: ${{ env.ACTIONS_ID_TOKEN_REQUEST_URL }}
+          AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          ASG_NAME: ${{ secrets.ASG_NAME }}
 
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
@@ -69,19 +88,21 @@ jobs:
         run: |
           aws autoscaling update-auto-scaling-group \
             --auto-scaling-group-name "${{ secrets.ASG_NAME }}" \
-            --max-size 8
+            --max-size 8 \
+            --region "${AWS_REGION}"
 
       - name: Start rolling Instance Refresh
         run: |
           aws autoscaling start-instance-refresh \
             --auto-scaling-group-name "${{ secrets.ASG_NAME }}" \
-            --preferences MinHealthyPercentage=90,InstanceWarmup=120
+            --preferences MinHealthyPercentage=90,InstanceWarmup=120 \
+            --region "${AWS_REGION}"
 
       - name: Wait for Instance Refresh to complete
         run: |
           ASG="${{ secrets.ASG_NAME }}"
           for i in {1..120}; do
-            STATUS=$(aws autoscaling describe-instance-refreshes --auto-scaling-group-name "$ASG" --query 'InstanceRefreshes[0].Status' --output text)
+            STATUS=$(aws autoscaling describe-instance-refreshes --auto-scaling-group-name "$ASG" --query 'InstanceRefreshes[0].Status' --output text --region "${AWS_REGION}")
             echo "Refresh status: $STATUS"
             if [ "$STATUS" = "Successful" ]; then exit 0; fi
             if [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "Failed" ]; then exit 1; fi
@@ -94,4 +115,5 @@ jobs:
         run: |
           aws autoscaling update-auto-scaling-group \
             --auto-scaling-group-name "${{ secrets.ASG_NAME }}" \
-            --max-size 6
+            --max-size 6 \
+            --region "${AWS_REGION}"
