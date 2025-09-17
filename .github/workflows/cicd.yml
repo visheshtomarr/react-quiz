@@ -74,7 +74,7 @@ jobs:
         run: |
           aws autoscaling update-auto-scaling-group \
             --auto-scaling-group-name "${{ secrets.ASG_NAME }}" \
-            --max-size 8 \
+            --max-size 6 \
             --region "${AWS_REGION}"
 
       - name: Start rolling Instance Refresh
@@ -101,5 +101,5 @@ jobs:
         run: |
           aws autoscaling update-auto-scaling-group \
             --auto-scaling-group-name "${{ secrets.ASG_NAME }}" \
-            --max-size 6 \
+            --max-size 4 \
             --region "${AWS_REGION}"

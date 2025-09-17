@@ -22,8 +22,8 @@ function Header() {
   return (
     <header className='app-header'>
       <img src='logo512.png' alt='React logo' />
-      <h1>The React Quiz V5</h1>
-      <p style={{ fontSize: '0.9rem', color: '#666' }}>Server: {serverIdentity}</p>
+      <h1>The React Quiz V6</h1>
+      <p style={{ fontSize: '1.1rem', color: '#666' }}>Server: {serverIdentity}</p>
     </header>
   );
 }
