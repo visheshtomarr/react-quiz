@@ -11,8 +11,6 @@ permissions:
 jobs:
   build-and-push-ecr:
     runs-on: ubuntu-latest
-    outputs:
-      image_uri: ${{ steps.out.outputs.uri }}
     steps:
       - uses: actions/checkout@v4
 
@@ -49,11 +47,6 @@ jobs:
           docker push "${{ steps.meta.outputs.image }}:latest"
           docker push "${{ steps.meta.outputs.image }}:${{ github.sha }}"
 
-      - name: Export image URI (for deploy job)
-        id: out
-        run: |
-          echo "uri=${{ steps.meta.outputs.image }}:${{ github.sha }}" >> $GITHUB_OUTPUT
-
   deploy-bluegreen:
     needs: build-and-push-ecr
     runs-on: ubuntu-latest
@@ -64,7 +57,7 @@ jobs:
       ASG_GREEN: ${{ secrets.ASG_GREEN }}
       TG_BLUE_NAME: react-quiz-tg
       TG_GREEN_NAME: react-quiz-tg-green
-      IMAGE_URI: ${{ needs.build-and-push-ecr.outputs.image_uri }}
+
     steps:
       - name: Configure AWS
         uses: aws-actions/configure-aws-credentials@v4
@@ -73,7 +66,24 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Install jq (used to parse listener JSON)
+      - name: Login to Amazon ECR (for registry)
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Compose IMAGE_URI for this commit
+        id: img
+        run: |
+          echo "uri=${{ steps.ecr.outputs.registry }}/${{ secrets.ECR_REPO }}:${{ github.sha }}" >> $GITHUB_OUTPUT
+          echo "IMAGE_URI=${{ steps.ecr.outputs.registry }}/${{ secrets.ECR_REPO }}:${{ github.sha }}"
+
+      - name: "Guard: IMAGE_URI must be non-empty"
+        run: |
+          if [ -z "${{ steps.img.outputs.uri }}" ]; then
+            echo "ERROR: IMAGE_URI is empty. Check ECR login/ECR_REPO/region secrets." >&2
+            exit 1
+          fi
+
+      - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
       - name: Resolve TG ARNs by Name
@@ -110,12 +120,12 @@ jobs:
             echo "CUR_ASG=${{ env.ASG_GREEN }}"           >> $GITHUB_OUTPUT
           fi
 
-      - name: Update SSM with new image
+      - name: Update SSM with new image (non-empty)
         run: |
           aws ssm put-parameter --name "/react-quiz/imageUri" --type String --overwrite \
-            --value "${IMAGE_URI}"
+            --value "${{ steps.img.outputs.uri }}"
 
-      # --- Blue/Green flip with 1 -> 1 -> flip -> 0 (steady-state Min=1, Max=3 on active) ---
+      # --- Blue/Green: 1 -> 1 -> flip -> 0 ---
 
       - name: Ensure NEXT ASG Max=3
         run: |
@@ -141,7 +151,7 @@ jobs:
           done
           echo "Timed out waiting for healthy targets"; exit 1
 
-      - name: Flip listener 100% to NEXT TG (CUR=0)
+      - name: Flip listener 100% to NEXT TG
         run: |
           aws elbv2 modify-listener \
             --listener-arn "$LISTENER_ARN" \
@@ -158,7 +168,7 @@ jobs:
             --auto-scaling-group-name "${{ steps.vars.outputs.CUR_ASG }}" \
             --min-size 0 --desired-capacity 0
 
-      - name: Ensure NEXT ASG left at Min=1 / Max=3 (steady state)
+      - name: Ensure NEXT ASG left at Min=1 / Max=3
         run: |
           aws autoscaling update-auto-scaling-group \
             --auto-scaling-group-name "${{ steps.vars.outputs.NEXT_ASG }}" \
