@@ -12,10 +12,7 @@ jobs:
   build-and-push-ecr:
     runs-on: ubuntu-latest
     outputs:
-      image_uri: ${{ steps.image.outputs.uri }}
-    env:
-      AWS_REGION: ${{ secrets.AWS_REGION }}
-      ECR_REPO: ${{ secrets.ECR_REPO }}
+      image_uri: ${{ steps.out.outputs.uri }}
     steps:
       - uses: actions/checkout@v4
 
@@ -26,34 +23,36 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Get AWS Account ID
-        id: acct
-        run: echo "id=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_OUTPUT
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Login to ECR
-        run: aws ecr get-login-password --region "$AWS_REGION" \
-          | docker login --username AWS --password-stdin ${{ steps.acct.outputs.id }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
-
-      - name: Ensure ECR repo
+      - name: Ensure ECR repo exists
         run: |
-          aws ecr describe-repositories --repository-names "${ECR_REPO}" >/dev/null 2>&1 || \
-          aws ecr create-repository --repository-name "${ECR_REPO}"
+          aws ecr describe-repositories --repository-names "${{ secrets.ECR_REPO }}" >/dev/null 2>&1 || \
+          aws ecr create-repository --repository-name "${{ secrets.ECR_REPO }}"
 
-      - name: Build
+      - name: Set image coordinates
+        id: meta
         run: |
-          IMAGE="${{ steps.acct.outputs.id }}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
-          docker build -t "${IMAGE}:latest" -t "${IMAGE}:${{ github.sha }}" .
+          echo "registry=${{ steps.ecr.outputs.registry }}" >> $GITHUB_OUTPUT
+          echo "image=${{ steps.ecr.outputs.registry }}/${{ secrets.ECR_REPO }}" >> $GITHUB_OUTPUT
 
-      - name: Push
+      - name: Build image
         run: |
-          IMAGE="${{ steps.acct.outputs.id }}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
-          docker push "${IMAGE}:latest"
-          docker push "${IMAGE}:${{ github.sha }}"
+          docker build \
+            -t "${{ steps.meta.outputs.image }}:latest" \
+            -t "${{ steps.meta.outputs.image }}:${{ github.sha }}" .
 
-      - name: Export image uri
-        id: image
+      - name: Push image
         run: |
-          echo "uri=${{ steps.acct.outputs.id }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ github.sha }}" >> $GITHUB_OUTPUT
+          docker push "${{ steps.meta.outputs.image }}:latest"
+          docker push "${{ steps.meta.outputs.image }}:${{ github.sha }}"
+
+      - name: Export image URI (for deploy job)
+        id: out
+        run: |
+          echo "uri=${{ steps.meta.outputs.image }}:${{ github.sha }}" >> $GITHUB_OUTPUT
 
   deploy-bluegreen:
     needs: build-and-push-ecr
@@ -65,6 +64,7 @@ jobs:
       ASG_GREEN: ${{ secrets.ASG_GREEN }}
       TG_BLUE_NAME: react-quiz-tg
       TG_GREEN_NAME: react-quiz-tg-green
+      IMAGE_URI: ${{ needs.build-and-push-ecr.outputs.image_uri }}
     steps:
       - name: Configure AWS
         uses: aws-actions/configure-aws-credentials@v4
@@ -72,6 +72,9 @@ jobs:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Install jq (used to parse listener JSON)
+        run: sudo apt-get update && sudo apt-get install -y jq
 
       - name: Resolve TG ARNs by Name
         id: tgs
@@ -110,11 +113,11 @@ jobs:
       - name: Update SSM with new image
         run: |
           aws ssm put-parameter --name "/react-quiz/imageUri" --type String --overwrite \
-            --value "${{ needs.build-and-push-ecr.outputs.image_uri }}"
+            --value "${IMAGE_URI}"
 
-      # --- Blue/Green flip with 1->1->flip->0 ---
+      # --- Blue/Green flip with 1 -> 1 -> flip -> 0 (steady-state Min=1, Max=3 on active) ---
 
-      - name: Ensure NEXT ASG max-size = 3
+      - name: Ensure NEXT ASG Max=3
         run: |
           aws autoscaling update-auto-scaling-group \
             --auto-scaling-group-name "${{ steps.vars.outputs.NEXT_ASG }}" \
