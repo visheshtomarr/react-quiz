@@ -1,4 +1,4 @@
-name: CICD Pipeline
+name: CICD BlueGreen
 
 on:
   push:
@@ -9,97 +9,154 @@ permissions:
   contents: read
 
 jobs:
-  build-and-push:
+  build-and-push-ecr:
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKER_HUB_USERNAME }}
-          password: ${{ secrets.DOCKER_HUB_PASSWORD }}
-
-      - name: Build & tag image
-        run: |
-          docker build \
-            -t visheshtomarr/react-quiz-app:latest \
-            -t visheshtomarr/react-quiz-app:${{ github.sha }} \
-            .
-
-      - name: Push images
-        run: |
-          docker push visheshtomarr/react-quiz-app:latest
-          docker push visheshtomarr/react-quiz-app:${{ github.sha }}
-
-  rollout:
-    needs: build-and-push
-    runs-on: ubuntu-latest
+    outputs:
+      image_uri: ${{ steps.image.outputs.uri }}
     env:
       AWS_REGION: ${{ secrets.AWS_REGION }}
+      ECR_REPO: ${{ secrets.ECR_REPO }}
     steps:
-      - name: Check required secrets
-        run: |
-          if [ -z "${AWS_ACCESS_KEY_ID}" ]; then
-            echo "ERROR: AWS_ACCESS_KEY_ID secret is not set in repository settings."
-            exit 1
-          fi
-          if [ -z "${AWS_SECRET_ACCESS_KEY}" ]; then
-            echo "ERROR: AWS_SECRET_ACCESS_KEY secret is not set in repository settings."
-            exit 1
-          fi
-          if [ -z "${AWS_REGION}" ]; then
-            echo "ERROR: AWS_REGION secret is not set in repository settings."
-            exit 1
-          fi
-          if [ -z "${ASG_NAME}" ]; then
-            echo "ERROR: ASG_NAME secret is not set in repository settings."
-            exit 1
-          fi
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_REGION: ${{ secrets.AWS_REGION }}
-          ASG_NAME: ${{ secrets.ASG_NAME }}
+      - uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
+      - name: Configure AWS
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: (Optional) Raise ASG max size for safer rolling
+      - name: Get AWS Account ID
+        id: acct
+        run: echo "id=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_OUTPUT
+
+      - name: Login to ECR
+        run: aws ecr get-login-password --region "$AWS_REGION" \
+          | docker login --username AWS --password-stdin ${{ steps.acct.outputs.id }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+
+      - name: Ensure ECR repo
+        run: |
+          aws ecr describe-repositories --repository-names "${ECR_REPO}" >/dev/null 2>&1 || \
+          aws ecr create-repository --repository-name "${ECR_REPO}"
+
+      - name: Build
+        run: |
+          IMAGE="${{ steps.acct.outputs.id }}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
+          docker build -t "${IMAGE}:latest" -t "${IMAGE}:${{ github.sha }}" .
+
+      - name: Push
+        run: |
+          IMAGE="${{ steps.acct.outputs.id }}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
+          docker push "${IMAGE}:latest"
+          docker push "${IMAGE}:${{ github.sha }}"
+
+      - name: Export image uri
+        id: image
+        run: |
+          echo "uri=${{ steps.acct.outputs.id }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ github.sha }}" >> $GITHUB_OUTPUT
+
+  deploy-bluegreen:
+    needs: build-and-push-ecr
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      LISTENER_ARN: ${{ secrets.LISTENER_ARN }}
+      ASG_BLUE: ${{ secrets.ASG_BLUE }}
+      ASG_GREEN: ${{ secrets.ASG_GREEN }}
+      TG_BLUE_NAME: react-quiz-tg
+      TG_GREEN_NAME: react-quiz-tg-green
+    steps:
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Resolve TG ARNs by Name
+        id: tgs
+        run: |
+          TG_BLUE_ARN=$(aws elbv2 describe-target-groups --names "$TG_BLUE_NAME" --query 'TargetGroups[0].TargetGroupArn' --output text)
+          TG_GREEN_ARN=$(aws elbv2 describe-target-groups --names "$TG_GREEN_NAME" --query 'TargetGroups[0].TargetGroupArn' --output text)
+          echo "blue=$TG_BLUE_ARN"  >> $GITHUB_OUTPUT
+          echo "green=$TG_GREEN_ARN" >> $GITHUB_OUTPUT
+
+      - name: Determine active color by listener weights
+        id: active
+        run: |
+          ACTIONS=$(aws elbv2 describe-listeners --listener-arn "$LISTENER_ARN" --query 'Listeners[0].DefaultActions' --output json)
+          BLUE_WEIGHT=$(echo "$ACTIONS" | jq '[.[] | select(.Type=="forward") | .ForwardConfig.TargetGroups[] | select(.TargetGroupArn=="'"${{ steps.tgs.outputs.blue }}"'") | .Weight] | add')
+          if [ "${BLUE_WEIGHT:-0}" -eq 100 ]; then
+            echo "color=blue" >> $GITHUB_OUTPUT
+          else
+            echo "color=green" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Pick NEXT/CUR variables
+        id: vars
+        run: |
+          if [ "${{ steps.active.outputs.color }}" = "blue" ]; then
+            echo "NEXT_TG=${{ steps.tgs.outputs.green }}" >> $GITHUB_OUTPUT
+            echo "CUR_TG=${{ steps.tgs.outputs.blue }}"   >> $GITHUB_OUTPUT
+            echo "NEXT_ASG=${{ env.ASG_GREEN }}"          >> $GITHUB_OUTPUT
+            echo "CUR_ASG=${{ env.ASG_BLUE }}"            >> $GITHUB_OUTPUT
+          else
+            echo "NEXT_TG=${{ steps.tgs.outputs.blue }}"  >> $GITHUB_OUTPUT
+            echo "CUR_TG=${{ steps.tgs.outputs.green }}"  >> $GITHUB_OUTPUT
+            echo "NEXT_ASG=${{ env.ASG_BLUE }}"           >> $GITHUB_OUTPUT
+            echo "CUR_ASG=${{ env.ASG_GREEN }}"           >> $GITHUB_OUTPUT
+          fi
+
+      - name: Update SSM with new image
+        run: |
+          aws ssm put-parameter --name "/react-quiz/imageUri" --type String --overwrite \
+            --value "${{ needs.build-and-push-ecr.outputs.image_uri }}"
+
+      # --- Blue/Green flip with 1->1->flip->0 ---
+
+      - name: Ensure NEXT ASG max-size = 3
         run: |
           aws autoscaling update-auto-scaling-group \
-            --auto-scaling-group-name "${{ secrets.ASG_NAME }}" \
-            --max-size 6 \
-            --region "${AWS_REGION}"
+            --auto-scaling-group-name "${{ steps.vars.outputs.NEXT_ASG }}" \
+            --max-size 3
 
-      - name: Start rolling Instance Refresh
+      - name: Scale NEXT ASG to Min=1 / Desired=1
         run: |
-          aws autoscaling start-instance-refresh \
-            --auto-scaling-group-name "${{ secrets.ASG_NAME }}" \
-            --preferences MinHealthyPercentage=90,InstanceWarmup=120 \
-            --region "${AWS_REGION}"
+          aws autoscaling update-auto-scaling-group \
+            --auto-scaling-group-name "${{ steps.vars.outputs.NEXT_ASG }}" \
+            --min-size 1 --desired-capacity 1
 
-      - name: Wait for Instance Refresh to complete
+      - name: Wait NEXT TG healthy >= 1
         run: |
-          ASG="${{ secrets.ASG_NAME }}"
+          TG="${{ steps.vars.outputs.NEXT_TG }}"
           for i in {1..120}; do
-            STATUS=$(aws autoscaling describe-instance-refreshes --auto-scaling-group-name "$ASG" --query 'InstanceRefreshes[0].Status' --output text --region "${AWS_REGION}")
-            echo "Refresh status: $STATUS"
-            if [ "$STATUS" = "Successful" ]; then exit 0; fi
-            if [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "Failed" ]; then exit 1; fi
-            sleep 15
+            COUNT=$(aws elbv2 describe-target-health --target-group-arn "$TG" \
+              --query 'TargetHealthDescriptions[?TargetHealth.State==`healthy`]|length(@)')
+            echo "Healthy targets in NEXT TG: $COUNT"
+            if [ "$COUNT" -ge 1 ]; then exit 0; fi
+            sleep 5
           done
-          echo "Timed out waiting for instance refresh"; exit 1
+          echo "Timed out waiting for healthy targets"; exit 1
 
-      - name: Restore ASG max size
-        if: always()
+      - name: Flip listener 100% to NEXT TG (CUR=0)
+        run: |
+          aws elbv2 modify-listener \
+            --listener-arn "$LISTENER_ARN" \
+            --default-actions Type=forward,ForwardConfig='{
+              "TargetGroups":[
+                {"TargetGroupArn":"'"${{ steps.vars.outputs.NEXT_TG }}"'","Weight":100},
+                {"TargetGroupArn":"'"${{ steps.vars.outputs.CUR_TG }}"'","Weight":0}
+              ]
+            }'
+
+      - name: Scale CURRENT ASG to Min=0 / Desired=0
         run: |
           aws autoscaling update-auto-scaling-group \
-            --auto-scaling-group-name "${{ secrets.ASG_NAME }}" \
-            --max-size 4 \
-            --region "${AWS_REGION}"
+            --auto-scaling-group-name "${{ steps.vars.outputs.CUR_ASG }}" \
+            --min-size 0 --desired-capacity 0
+
+      - name: Ensure NEXT ASG left at Min=1 / Max=3 (steady state)
+        run: |
+          aws autoscaling update-auto-scaling-group \
+            --auto-scaling-group-name "${{ steps.vars.outputs.NEXT_ASG }}" \
+            --min-size 1 --max-size 3
