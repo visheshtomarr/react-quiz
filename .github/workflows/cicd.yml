@@ -1,175 +1,48 @@
-name: CICD BlueGreen
+name: Deploy React Quiz to S3
 
 on:
   push:
-    branches: [main]
-
-permissions:
-  id-token: write
-  contents: read
+    branches: ["main"]
+  workflow_dispatch:
 
 jobs:
-  build-and-push-ecr:
+  build-and-deploy:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
 
-      - name: Configure AWS
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
-
-      - name: Login to Amazon ECR
-        id: ecr
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Ensure ECR repo exists
-        run: |
-          aws ecr describe-repositories --repository-names "${{ secrets.ECR_REPO }}" >/dev/null 2>&1 || \
-          aws ecr create-repository --repository-name "${{ secrets.ECR_REPO }}"
-
-      - name: Set image coordinates
-        id: meta
-        run: |
-          echo "registry=${{ steps.ecr.outputs.registry }}" >> $GITHUB_OUTPUT
-          echo "image=${{ steps.ecr.outputs.registry }}/${{ secrets.ECR_REPO }}" >> $GITHUB_OUTPUT
-
-      - name: Build image
-        run: |
-          docker build \
-            -t "${{ steps.meta.outputs.image }}:latest" \
-            -t "${{ steps.meta.outputs.image }}:${{ github.sha }}" .
-
-      - name: Push image
-        run: |
-          docker push "${{ steps.meta.outputs.image }}:latest"
-          docker push "${{ steps.meta.outputs.image }}:${{ github.sha }}"
-
-  deploy-bluegreen:
-    needs: build-and-push-ecr
-    runs-on: ubuntu-latest
     env:
       AWS_REGION: ${{ secrets.AWS_REGION }}
-      LISTENER_ARN: ${{ secrets.LISTENER_ARN }}
-      ASG_BLUE: ${{ secrets.ASG_BLUE }}
-      ASG_GREEN: ${{ secrets.ASG_GREEN }}
-      TG_BLUE_NAME: react-quiz-tg
-      TG_GREEN_NAME: react-quiz-tg-green
+      S3_BUCKET: ${{ secrets.S3_BUCKET }}
 
     steps:
-      - name: Configure AWS
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Use Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      # Configure static credentials
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Login to Amazon ECR (for registry)
-        id: ecr
-        uses: aws-actions/amazon-ecr-login@v2
+      # Sync everything
+      - name: Sync build/ to S3
+        run: aws s3 sync build/ "s3://${S3_BUCKET}/" --delete
 
-      - name: Compose IMAGE_URI for this commit
-        id: img
+      # Make sure index.html isn't cached too long (so new builds appear immediately)
+      - name: Set no-cache on index.html
         run: |
-          echo "uri=${{ steps.ecr.outputs.registry }}/${{ secrets.ECR_REPO }}:${{ github.sha }}" >> $GITHUB_OUTPUT
-          echo "IMAGE_URI=${{ steps.ecr.outputs.registry }}/${{ secrets.ECR_REPO }}:${{ github.sha }}"
-
-      - name: "Guard: IMAGE_URI must be non-empty"
-        run: |
-          if [ -z "${{ steps.img.outputs.uri }}" ]; then
-            echo "ERROR: IMAGE_URI is empty. Check ECR login/ECR_REPO/region secrets." >&2
-            exit 1
-          fi
-
-      - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
-
-      - name: Resolve TG ARNs by Name
-        id: tgs
-        run: |
-          TG_BLUE_ARN=$(aws elbv2 describe-target-groups --names "$TG_BLUE_NAME" --query 'TargetGroups[0].TargetGroupArn' --output text)
-          TG_GREEN_ARN=$(aws elbv2 describe-target-groups --names "$TG_GREEN_NAME" --query 'TargetGroups[0].TargetGroupArn' --output text)
-          echo "blue=$TG_BLUE_ARN"  >> $GITHUB_OUTPUT
-          echo "green=$TG_GREEN_ARN" >> $GITHUB_OUTPUT
-
-      - name: Determine active color by listener weights
-        id: active
-        run: |
-          ACTIONS=$(aws elbv2 describe-listeners --listener-arn "$LISTENER_ARN" --query 'Listeners[0].DefaultActions' --output json)
-          BLUE_WEIGHT=$(echo "$ACTIONS" | jq '[.[] | select(.Type=="forward") | .ForwardConfig.TargetGroups[] | select(.TargetGroupArn=="'"${{ steps.tgs.outputs.blue }}"'") | .Weight] | add')
-          if [ "${BLUE_WEIGHT:-0}" -eq 100 ]; then
-            echo "color=blue" >> $GITHUB_OUTPUT
-          else
-            echo "color=green" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Pick NEXT/CUR variables
-        id: vars
-        run: |
-          if [ "${{ steps.active.outputs.color }}" = "blue" ]; then
-            echo "NEXT_TG=${{ steps.tgs.outputs.green }}" >> $GITHUB_OUTPUT
-            echo "CUR_TG=${{ steps.tgs.outputs.blue }}"   >> $GITHUB_OUTPUT
-            echo "NEXT_ASG=${{ env.ASG_GREEN }}"          >> $GITHUB_OUTPUT
-            echo "CUR_ASG=${{ env.ASG_BLUE }}"            >> $GITHUB_OUTPUT
-          else
-            echo "NEXT_TG=${{ steps.tgs.outputs.blue }}"  >> $GITHUB_OUTPUT
-            echo "CUR_TG=${{ steps.tgs.outputs.green }}"  >> $GITHUB_OUTPUT
-            echo "NEXT_ASG=${{ env.ASG_BLUE }}"           >> $GITHUB_OUTPUT
-            echo "CUR_ASG=${{ env.ASG_GREEN }}"           >> $GITHUB_OUTPUT
-          fi
-
-      - name: Update SSM with new image (non-empty)
-        run: |
-          aws ssm put-parameter --name "/react-quiz/imageUri" --type String --overwrite \
-            --value "${{ steps.img.outputs.uri }}"
-
-      # --- Blue/Green: 1 -> 1 -> flip -> 0 ---
-
-      - name: Ensure NEXT ASG Max=3
-        run: |
-          aws autoscaling update-auto-scaling-group \
-            --auto-scaling-group-name "${{ steps.vars.outputs.NEXT_ASG }}" \
-            --max-size 3
-
-      - name: Scale NEXT ASG to Min=1 / Desired=1
-        run: |
-          aws autoscaling update-auto-scaling-group \
-            --auto-scaling-group-name "${{ steps.vars.outputs.NEXT_ASG }}" \
-            --min-size 1 --desired-capacity 1
-
-      - name: Wait NEXT TG healthy >= 1
-        run: |
-          TG="${{ steps.vars.outputs.NEXT_TG }}"
-          for i in {1..120}; do
-            COUNT=$(aws elbv2 describe-target-health --target-group-arn "$TG" \
-              --query 'TargetHealthDescriptions[?TargetHealth.State==`healthy`]|length(@)')
-            echo "Healthy targets in NEXT TG: $COUNT"
-            if [ "$COUNT" -ge 1 ]; then exit 0; fi
-            sleep 5
-          done
-          echo "Timed out waiting for healthy targets"; exit 1
-
-      - name: Flip listener 100% to NEXT TG
-        run: |
-          aws elbv2 modify-listener \
-            --listener-arn "$LISTENER_ARN" \
-            --default-actions Type=forward,ForwardConfig='{
-              "TargetGroups":[
-                {"TargetGroupArn":"'"${{ steps.vars.outputs.NEXT_TG }}"'","Weight":100},
-                {"TargetGroupArn":"'"${{ steps.vars.outputs.CUR_TG }}"'","Weight":0}
-              ]
-            }'
-
-      - name: Scale CURRENT ASG to Min=0 / Desired=0
-        run: |
-          aws autoscaling update-auto-scaling-group \
-            --auto-scaling-group-name "${{ steps.vars.outputs.CUR_ASG }}" \
-            --min-size 0 --desired-capacity 0
-
-      - name: Ensure NEXT ASG left at Min=1 / Max=3
-        run: |
-          aws autoscaling update-auto-scaling-group \
-            --auto-scaling-group-name "${{ steps.vars.outputs.NEXT_ASG }}" \
-            --min-size 1 --max-size 3
+          aws s3 cp "build/index.html" "s3://${S3_BUCKET}/index.html" \
+            --cache-control "no-cache, no-store, must-revalidate" \
+            --content-type "text/html" --metadata-directive REPLACE
